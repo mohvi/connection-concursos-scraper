@@ -15,7 +15,15 @@ const { fetchOpenTenders, normalizeTender } = require('./lib');
 const DRY_RUN = process.argv.includes('--dry-run');
 const SKIP_EMAIL = process.argv.includes('--skip-email');
 const SEND_EMAIL_URL = process.env.SEND_EMAIL_URL || 'https://mohvi-sendmail.vercel.app/send-email';
-const MAX_EMAILS_PER_RUN = 40; // same rate-limit ceiling reasoning as mohvi-sendmail's email-campaigns job
+// mohvi-sendmail's /send-email caps at 50 requests/15min per IP. Recipients
+// here are a bounded, known population (paying moduloSMS customers), not an
+// open-ended backlog — so instead of a hard cap that would silently and
+// permanently skip whoever doesn't fit in the first batch every single day,
+// we send in batches of BATCH_SIZE and wait out the rate-limit window
+// between batches until everyone eligible actually gets the digest.
+const BATCH_SIZE = 45;
+const BATCH_WAIT_MS = 15 * 60 * 1000;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 initializeApp({
@@ -129,16 +137,20 @@ async function run() {
   console.log(`Empresas elegíveis (moduloSMS ativo e verificadas): ${recipients.length}`);
 
   const { subject, text } = buildDigestEmail(openNewTenders);
-  const sendTo = recipients.slice(0, MAX_EMAILS_PER_RUN);
-  if (recipients.length > MAX_EMAILS_PER_RUN) {
-    console.log(`Mais destinatários (${recipients.length}) do que o limite por execução (${MAX_EMAILS_PER_RUN}) — os restantes não recebem este digest, mas os concursos continuam visíveis na aba "Concursos".`);
+  const batches = [];
+  for (let i = 0; i < recipients.length; i += BATCH_SIZE) batches.push(recipients.slice(i, i + BATCH_SIZE));
+  if (batches.length > 1) {
+    console.log(`${recipients.length} destinatários — a enviar em ${batches.length} lotes de até ${BATCH_SIZE}, com pausa de 15min entre lotes para respeitar o limite do servidor de email.`);
   }
 
   let emailsSent = 0;
-  for (const company of sendTo) {
-    const outcome = await sendEmail(company.email, subject, text);
-    if (outcome.success) emailsSent += 1;
-    else console.log(`  FALHOU: ${company.email}`);
+  for (let b = 0; b < batches.length; b += 1) {
+    if (b > 0 && !DRY_RUN) await sleep(BATCH_WAIT_MS);
+    for (const company of batches[b]) {
+      const outcome = await sendEmail(company.email, subject, text);
+      if (outcome.success) emailsSent += 1;
+      else console.log(`  FALHOU: ${company.email}`);
+    }
   }
 
   if (!DRY_RUN) {
@@ -149,7 +161,7 @@ async function run() {
     await db.ref().update(notifiedWrites);
   }
 
-  console.log(`Digest enviado a ${emailsSent}/${sendTo.length} empresas (${DRY_RUN ? 'dry-run' : 'real'}).`);
+  console.log(`Digest enviado a ${emailsSent}/${recipients.length} empresas (${DRY_RUN ? 'dry-run' : 'real'}).`);
 }
 
 run()
