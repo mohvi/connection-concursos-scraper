@@ -1,0 +1,19 @@
+{
+  "name": "connection-concursos-scraper",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node run.js",
+    "dry-run": "node run.js --dry-run",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^18.0.1",
+    "firebase-admin": "^14.4.0"
+  }
+}
