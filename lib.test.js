@@ -1,47 +1,46 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { normalizeRelease, stripHtml } = require('./lib');
+const { parseListingHtml, normalizeTender } = require('./lib');
 
-test('stripHtml removes tags and collapses whitespace', () => {
-  assert.equal(stripHtml('<font size="3">Olá   mundo</font>'), 'Olá mundo');
+const SAMPLE_ROW = `
+<table width='800' border='0' id='lista' class='tabela' >
+<tr align='left'>
+<td width='170'>AJUSTE DIRECTO:<br />31I001841/AD/03<br />
+/2026<br/><a href='concurso_detalhes.php?referencia=31I001841/AD/03/2026'>Ver detalhes</a><br/> </td>
+<td width='200'>BENS E SERVICOS:<br/> SERVICO DE MANUTENCAO E REPARACAO DE VIATURAS <br/><br/></td>
+<td width='175'>DELEGACAO DISTRITAL DE TESTE <br/><br/></td>
+<td width='100'>INHAMBANE</td>
+<td width='65' align='right'>2026-09-16</td>
+<td width='75' align='right'>2026-09-21<br/>08H00<br/></td>
+</tr>
+</table>
+`;
+
+test('parseListingHtml extracts every field from a real UFSA row', () => {
+  const [tender] = parseListingHtml(SAMPLE_ROW);
+  assert.equal(tender.reference, '31I001841/AD/03/2026');
+  assert.equal(tender.modality, 'AJUSTE DIRECTO');
+  assert.equal(tender.category, 'BENS E SERVICOS');
+  assert.equal(tender.title, 'SERVICO DE MANUTENCAO E REPARACAO DE VIATURAS');
+  assert.equal(tender.buyerName, 'DELEGACAO DISTRITAL DE TESTE');
+  assert.equal(tender.provincia, 'INHAMBANE');
+  assert.equal(tender.launchDate, '2026-09-16');
 });
 
-test('normalizeRelease marks a future, planned tender as aberto', () => {
-  const future = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-  const release = {
-    ocid: 'ocds-test-1',
-    date: '2026-01-01T00:00:00Z',
-    tender: {
-      title: 'Teste',
-      description: '<p>Descrição</p>',
-      status: 'planned',
-      tenderPeriod: { startDate: future, endDate: future },
-      value: { amount: 1000, currency: 'MZN' },
-      procuringEntity: { name: 'Entidade Teste' },
-      documents: [{ title: 'Doc', url: 'https://example.com/doc.pdf' }],
-    },
-  };
-  const result = normalizeRelease(release);
-  assert.equal(result.status, 'aberto');
-  assert.equal(result.title, 'Teste');
-  assert.equal(result.description, 'Descrição');
-  assert.equal(result.buyerName, 'Entidade Teste');
+test('parseListingHtml correctly separates date and time despite <br/> collapsing whitespace', () => {
+  const [tender] = parseListingHtml(SAMPLE_ROW);
+  // 08H00 in Mozambique (UTC+2, no DST) is 06:00 UTC.
+  assert.equal(tender.submissionDeadline, '2026-09-21T06:00:00.000Z');
 });
 
-test('normalizeRelease marks a past-deadline tender as expirado even if OCDS status is planned', () => {
-  const past = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const release = {
-    ocid: 'ocds-test-2',
-    tender: { title: 'Expirado', status: 'planned', tenderPeriod: { endDate: past } },
-  };
-  assert.equal(normalizeRelease(release).status, 'expirado');
-});
-
-test('normalizeRelease marks a cancelled tender as cancelado regardless of deadline', () => {
+test('normalizeTender marks a future deadline as aberto', () => {
   const future = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-  const release = {
-    ocid: 'ocds-test-3',
-    tender: { title: 'Cancelado', status: 'cancelled', tenderPeriod: { endDate: future } },
-  };
-  assert.equal(normalizeRelease(release).status, 'cancelado');
+  const result = normalizeTender({ reference: 'x', title: 'Teste', submissionDeadline: future });
+  assert.equal(result.status, 'aberto');
+});
+
+test('normalizeTender marks a past deadline as expirado', () => {
+  const past = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const result = normalizeTender({ reference: 'x', title: 'Teste', submissionDeadline: past });
+  assert.equal(result.status, 'expirado');
 });
