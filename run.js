@@ -4,9 +4,10 @@
 // open opportunities.
 //
 // Usage:
-//   node run.js               (writes to Firebase, sends real emails)
-//   node run.js --dry-run     (prints what it would do, no writes, no emails)
-//   node run.js --skip-email  (writes to Firebase for real, never emails)
+//   node run.js                      (writes to Firebase, sends real emails to all eligible companies)
+//   node run.js --dry-run            (prints what it would do, no writes, no emails)
+//   node run.js --skip-email         (writes to Firebase for real, never emails)
+//   node run.js --test-email=a@b.com (sends the real digest to ONLY this address; no Firebase writes, no real recipients touched)
 require('dotenv').config();
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getDatabase } = require('firebase-admin/database');
@@ -14,6 +15,8 @@ const { fetchOpenTenders, normalizeTender, fetchTenderDetails } = require('./lib
 
 const DRY_RUN = process.argv.includes('--dry-run');
 const SKIP_EMAIL = process.argv.includes('--skip-email');
+const TEST_EMAIL_ARG = process.argv.find((arg) => arg.startsWith('--test-email='));
+const TEST_EMAIL = TEST_EMAIL_ARG ? TEST_EMAIL_ARG.slice('--test-email='.length) : null;
 const SEND_EMAIL_URL = process.env.SEND_EMAIL_URL || 'https://mohvi-sendmail.vercel.app/send-email';
 // mohvi-sendmail's /send-email caps at 50 requests/15min per IP. Recipients
 // here are a bounded, known population (paying moduloSMS customers), not an
@@ -101,6 +104,23 @@ async function run() {
   // 1. Fetch every currently-open tender from UFSA (one request, no pagination).
   const raw = await fetchOpenTenders();
   console.log(`Lidos ${raw.length} concursos abertos da UFSA.`);
+
+  // Test mode: send the real digest format to a single address, using
+  // whatever tenders are currently open. No Firebase writes, no lookup of
+  // real companies — completely isolated from the production notify path.
+  if (TEST_EMAIL) {
+    const sample = raw.slice(0, 3).map((tender) => normalizeTender(tender, now));
+    if (sample.length === 0) {
+      console.log('Nenhum concurso aberto disponível para montar o email de teste.');
+      return;
+    }
+    const { subject, text } = buildDigestEmail(sample);
+    const outcome = await sendEmail(TEST_EMAIL, subject, text);
+    console.log(outcome.success
+      ? `Email de teste enviado com sucesso para ${TEST_EMAIL}.`
+      : `FALHOU o envio de teste para ${TEST_EMAIL}: ${JSON.stringify(outcome)}`);
+    return;
+  }
 
   // 2. Find which of these are genuinely new to us (before fetching any detail
   // pages — no point spending a crawl-delay-paced request on one we already have).
