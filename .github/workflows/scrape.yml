@@ -1,4 +1,5 @@
 name: Scrape UFSA concursos
+run-name: Scrape UFSA concursos
 
 on:
   schedule:
