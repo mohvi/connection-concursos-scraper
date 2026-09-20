@@ -10,7 +10,7 @@
 require('dotenv').config();
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getDatabase } = require('firebase-admin/database');
-const { fetchOpenTenders, normalizeTender } = require('./lib');
+const { fetchOpenTenders, normalizeTender, fetchTenderDetails } = require('./lib');
 
 const DRY_RUN = process.argv.includes('--dry-run');
 const SKIP_EMAIL = process.argv.includes('--skip-email');
@@ -24,6 +24,11 @@ const SEND_EMAIL_URL = process.env.SEND_EMAIL_URL || 'https://mohvi-sendmail.ver
 const BATCH_SIZE = 45;
 const BATCH_WAIT_MS = 15 * 60 * 1000;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// robots.txt on ufsa.gov.mz sets Crawl-delay: 10 for all bots. The listing
+// fetch is a single request (trivially compliant); detail-page fetches are
+// one request per NEW tender, so we pace those explicitly.
+const CRAWL_DELAY_MS = 10 * 1000;
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 initializeApp({
@@ -49,11 +54,15 @@ const describeTender = (tender) => {
   const deadline = tender.submissionDeadline
     ? new Date(tender.submissionDeadline).toLocaleString('pt-PT', { dateStyle: 'medium', timeStyle: 'short' })
     : 'não especificado';
+  const value = tender.valueAmount
+    ? `${Number(tender.valueAmount).toLocaleString('pt-MZ')} ${tender.valueCurrency || 'MZN'}`
+    : null;
+  const docs = (tender.documents || []).map((doc) => `  - ${doc.title}: ${doc.url}`).join('\n');
   return `[${tender.modality}] ${tender.title}
 Entidade: ${tender.buyerName || 'não especificado'}
 Província: ${tender.provincia || 'não especificado'}
-Prazo de submissão: ${deadline}
-Detalhes: ${tender.sourceUrl}`;
+${value ? `Valor estimado: ${value}\n` : ''}Prazo de submissão: ${deadline}
+Detalhes: ${tender.sourceUrl}${docs ? `\nDocumentos:\n${docs}` : ''}`;
 };
 
 // One digest email per run (not one email per tender) — nobody wants 5
@@ -91,21 +100,31 @@ async function run() {
 
   // 1. Fetch every currently-open tender from UFSA (one request, no pagination).
   const raw = await fetchOpenTenders();
-  const tenders = raw.map((tender) => normalizeTender(tender, now));
-  console.log(`Lidos ${tenders.length} concursos abertos da UFSA.`);
+  console.log(`Lidos ${raw.length} concursos abertos da UFSA.`);
 
-  // 2. Find which of these are genuinely new to us.
+  // 2. Find which of these are genuinely new to us (before fetching any detail
+  // pages — no point spending a crawl-delay-paced request on one we already have).
   const existingSnapshot = await db.ref('concursos_publicos').once('value');
   const existing = existingSnapshot.val() || {};
-  const newTenders = [];
-  for (const tender of tenders) {
-    const key = safeKey(tender.reference);
-    if (existing[key]) continue;
-    newTenders.push({ key, ...tender });
-  }
-  console.log(`Concursos novos encontrados: ${newTenders.length}`);
+  const newRaw = raw.filter((tender) => !existing[safeKey(tender.reference)]);
+  console.log(`Concursos novos encontrados: ${newRaw.length}`);
 
-  // 3. Persist all new tenders.
+  // 3. Fetch each new tender's detail page (valor estimado, documentos),
+  // one at a time with a 10s gap per ufsa.gov.mz's robots.txt Crawl-delay.
+  const newTenders = [];
+  for (let i = 0; i < newRaw.length; i += 1) {
+    const tender = newRaw[i];
+    if (i > 0) await sleep(CRAWL_DELAY_MS);
+    let details = null;
+    try {
+      details = await fetchTenderDetails(tender.sourceUrl);
+    } catch (error) {
+      console.log(`  Aviso: falha ao obter detalhes de ${tender.reference}: ${error.message}`);
+    }
+    newTenders.push({ key: safeKey(tender.reference), ...normalizeTender(tender, now, details) });
+  }
+
+  // 4. Persist all new tenders.
   if (!DRY_RUN) {
     const writes = {};
     newTenders.forEach((tender) => {
@@ -115,7 +134,7 @@ async function run() {
     if (Object.keys(writes).length > 0) await db.ref().update(writes);
   }
 
-  // 4. Notify companies with moduloSMS active about new OPEN tenders only.
+  // 5. Notify companies with moduloSMS active about new OPEN tenders only.
   const openNewTenders = newTenders.filter((t) => t.status === 'aberto');
   console.log(`Concursos novos e abertos (a notificar): ${openNewTenders.length}`);
 

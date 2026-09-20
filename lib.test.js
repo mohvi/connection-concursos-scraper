@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseListingHtml, normalizeTender } = require('./lib');
+const { parseListingHtml, normalizeTender, parseDetailHtml } = require('./lib');
 
 const SAMPLE_ROW = `
 <table width='800' border='0' id='lista' class='tabela' >
@@ -43,4 +43,36 @@ test('normalizeTender marks a past deadline as expirado', () => {
   const past = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const result = normalizeTender({ reference: 'x', title: 'Teste', submissionDeadline: past });
   assert.equal(result.status, 'expirado');
+});
+
+const SAMPLE_DETAIL = `
+<table>
+<tr><td width="20"></td><th>Valor Estimado:</th><td>650000.00</td></tr>
+<tr><td width="20"></td><th>Moeda:</th><td>MZN</td></tr>
+<tr><td width="20"></td><th>Objecto Geral:</th><td>Descrição completa do concurso</td></tr>
+</table>
+<a href='includes/Baixar_anuncio.php?REFERENCIA=X'>Descarregar Ficheiro de Anuncio</a>
+<a href='includes/Baixar_cad_enc.php?REFERENCIA=X'>Descarregar Documento de Concurso</a>
+`;
+
+test('parseDetailHtml extracts value, currency, full description and both document links', () => {
+  const details = parseDetailHtml(SAMPLE_DETAIL, 'https://www.ufsa.gov.mz/concurso_detalhes.php?referencia=X');
+  assert.equal(details.valorEstimado, '650000.00');
+  assert.equal(details.moeda, 'MZN');
+  // objetoGeral is upper-cased to correct a real upstream artifact where
+  // accented letters keep their original case while everything else
+  // becomes uppercase (PHP strtoupper() applied to UTF-8 bytes).
+  assert.equal(details.objetoGeral, 'DESCRIÇÃO COMPLETA DO CONCURSO');
+  assert.equal(details.documents.length, 2);
+  assert.equal(details.documents[0].url, 'https://www.ufsa.gov.mz/includes/Baixar_anuncio.php?REFERENCIA=X');
+});
+
+test('normalizeTender merges fetched details into valueAmount/valueCurrency/documents', () => {
+  const future = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  const details = { valorEstimado: '650000.00', moeda: 'MZN', objetoGeral: 'Descrição completa', documents: [{ title: 'Anúncio', url: 'https://x' }] };
+  const result = normalizeTender({ reference: 'x', title: 'Teste', submissionDeadline: future }, Date.now(), details);
+  assert.equal(result.valueAmount, 650000);
+  assert.equal(result.valueCurrency, 'MZN');
+  assert.equal(result.description, 'Descrição completa');
+  assert.equal(result.documents.length, 1);
 });

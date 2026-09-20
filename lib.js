@@ -16,6 +16,16 @@ const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 
 const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 
+// The bytes are genuinely UTF-8 (the page's own <meta charset=iso-8859-1> is
+// stale/wrong — decoding as Latin-1 makes accents worse, not better). The
+// real artifact is upstream, on UFSA's own system: some fields (Objecto
+// Geral in particular) come back with correctly-encoded but wrongly-cased
+// accented letters ("AQUISIçãO" instead of "AQUISIÇÃO") — a classic
+// PHP `strtoupper()`-only-uppercases-ASCII-bytes bug baked into their stored
+// data. Since this system's convention is ALL CAPS throughout, normalizing
+// case is a safe, targeted fix rather than a guess.
+const fixUpstreamCasing = (value) => (value ? value.toUpperCase() : value);
+
 // "2026-09-21" + "08H00" -> ISO datetime (server is in Mozambique local
 // time, CAT/UTC+2, which has no DST — safe to hardcode the offset).
 const parseDateTime = (dateStr, timeStr) => {
@@ -82,18 +92,91 @@ const parseListingHtml = (html) => {
 // Resolves our own status from the submission deadline. Every tender coming
 // from this endpoint is, by definition, currently listed as open by UFSA;
 // we only downgrade it ourselves once the deadline has actually passed.
-const normalizeTender = (tender, now = Date.now()) => {
+// `details` is optional (from fetchTenderDetails) — merged in when available.
+const normalizeTender = (tender, now = Date.now(), details = null) => {
   const deadline = tender.submissionDeadline ? Date.parse(tender.submissionDeadline) : null;
   const status = deadline && deadline < now ? 'expirado' : 'aberto';
+  const valorEstimado = details?.valorEstimado ? Number(details.valorEstimado) : null;
   return {
     ...tender,
     status,
-    description: tender.title,
-    valueAmount: null,
-    valueCurrency: null,
-    documents: [],
+    description: details?.objetoGeral || tender.title,
+    valueAmount: Number.isFinite(valorEstimado) && valorEstimado > 0 ? valorEstimado : null,
+    valueCurrency: details?.moeda || null,
+    documents: details?.documents || [],
     releaseDate: tender.launchDate,
   };
 };
 
-module.exports = { fetchOpenTenders, parseListingHtml, normalizeTender, DETAIL_URL };
+// Detail page has a label/value table (<th>Valor Estimado:</th><td>650000.00</td>,
+// sometimes <th>label</th><th>value</th> instead of th/td) plus two download
+// links at the bottom (Baixar_anuncio.php, Baixar_cad_enc.php). Technique
+// confirmed against a same-purpose scraper found already on this machine
+// (c:\Users\moham\scraper-concursos, dormant since Oct 2025) — its own
+// find-by-label approach, reimplemented here with cheerio instead of Puppeteer
+// since the detail pages, like the listing, don't need JS execution.
+const LABEL_FIELD_MAP = {
+  'valor estimado': 'valorEstimado',
+  'moeda': 'moeda',
+  'garantia provis': 'garantiaProvisoria', // matches "provisória" regardless of encoding
+  'criterio de adjudicacao': 'criterioAdjudicacao',
+  'critério de adjudicação': 'criterioAdjudicacao',
+  'numero de lotes': 'numeroLotes',
+  'entrega de propostas': 'localEntrega',
+  'regime': 'regime',
+  'classe': 'classeDetalhada',
+  'objecto geral': 'objetoGeral',
+  'objeto geral': 'objetoGeral',
+  'ugea': 'ugeaDetalhada',
+  'observa': 'observacoes',
+  'data de publica': 'dataPublicacao',
+};
+
+const matchLabel = (label) => {
+  const normalized = label.toLowerCase();
+  for (const [key, field] of Object.entries(LABEL_FIELD_MAP)) {
+    if (normalized.includes(key)) return field;
+  }
+  return null;
+};
+
+const fetchTenderDetails = async (detailUrl) => {
+  const res = await fetch(detailUrl, { headers: { 'User-Agent': USER_AGENT, Accept: 'text/html' } });
+  if (!res.ok) throw new Error(`UFSA respondeu ${res.status} em ${detailUrl}`);
+  const html = await res.text();
+  return parseDetailHtml(html, detailUrl);
+};
+
+const parseDetailHtml = (html, detailUrl) => {
+  const $ = cheerio.load(html);
+  const details = {};
+
+  $('tr').each((_, row) => {
+    const cells = $(row).find('th, td').filter((__, cell) => clean($(cell).text()) !== '');
+    if (cells.length < 2) return;
+    const label = clean($(cells[0]).text());
+    if (!label.endsWith(':')) return;
+    const field = matchLabel(label);
+    if (!field || details[field]) return;
+    const value = clean($(cells[1]).text());
+    if (!value) return;
+    // "Objecto Geral" is the field observed with the casing artifact; other
+    // fields on this page (codes, UGEA names, dates) come through clean.
+    details[field] = field === 'objetoGeral' ? fixUpstreamCasing(value) : value;
+  });
+
+  const documents = [];
+  $('a[href*="Baixar_anuncio"]').each((_, a) => {
+    documents.push({ title: 'Anúncio', url: new URL($(a).attr('href'), detailUrl).toString() });
+  });
+  $('a[href*="Baixar_cad_enc"]').each((_, a) => {
+    documents.push({ title: 'Documento de concurso', url: new URL($(a).attr('href'), detailUrl).toString() });
+  });
+
+  return { ...details, documents };
+};
+
+module.exports = {
+  fetchOpenTenders, parseListingHtml, normalizeTender, DETAIL_URL,
+  fetchTenderDetails, parseDetailHtml,
+};
